@@ -158,11 +158,24 @@ const defaultV3SwapEvent = 'event Swap(address indexed sender, address indexed r
 const defaultPoolCreatedEvent = 'event PoolCreated(address indexed token0, address indexed token1, uint24 indexed fee, int24 tickSpacing, address pool)'
 const defaultAlgebraV3PoolCreatedEvent = 'event Pool (address indexed token0, address indexed token1, address pool)'
 
-export const getUniV3LogAdapter: any = ({ factory, poolCreatedEvent, swapEvent = defaultV3SwapEvent, customLogic, isAlgebraV3 = false, isAlgebraV2 = false, userFeesRatio, revenueRatio, protocolRevenueRatio, holdersRevenueRatio, blacklistPools, pools }: UniV3Config): FetchV2 => {
+type UniV3FeeBreakdown = {
+  revenueRatio?: number,
+  protocolRevenueRatio?: number,
+  holdersRevenueRatio?: number,
+  supplySideRevenueRatio?: number,
+}
+
+type UniV3FeeBreakdownContext = {
+  pair: string,
+  chain: string,
+}
+
+export const getUniV3LogAdapter: any = ({ factory, poolCreatedEvent, swapEvent = defaultV3SwapEvent, customLogic, getFeeBreakdown, isAlgebraV3 = false, isAlgebraV2 = false, userFeesRatio, revenueRatio, protocolRevenueRatio, holdersRevenueRatio, blacklistPools, pools }: UniV3Config): FetchV2 => {
   const fetch: FetchV2 = async (fetchOptions) => {
     const { createBalances, getLogs, chain, api } = fetchOptions
     const pairObject: IJSON<string[]> = {}
     const fees: any = {}
+    const hasDynamicFeeBreakdown = typeof getFeeBreakdown === 'function'
 
     if (!chain) throw new Error('Wrong version?')
 
@@ -213,15 +226,19 @@ export const getUniV3LogAdapter: any = ({ factory, poolCreatedEvent, swapEvent =
     const filteredPairs = await filterPools({ api, pairs: pairObject, createBalances })
     const dailyVolume = createBalances()
     const dailyFees = createBalances()
+    const dynamicDailyRevenue = hasDynamicFeeBreakdown ? createBalances() : undefined
+    const dynamicDailyProtocolRevenue = hasDynamicFeeBreakdown ? createBalances() : undefined
+    const dynamicDailyHoldersRevenue = hasDynamicFeeBreakdown ? createBalances() : undefined
+    const dynamicDailySupplySideRevenue = hasDynamicFeeBreakdown ? createBalances() : undefined
 
     if (!Object.keys(filteredPairs).length) return {
       dailyVolume,
       dailyFees,
       dailyUserFees: userFeesRatio !== undefined ? 0 : undefined,
-      dailyRevenue: revenueRatio !== undefined ? 0 : undefined,
-      dailySupplySideRevenue: revenueRatio !== undefined ? 0 : undefined,
-      dailyProtocolRevenue: protocolRevenueRatio !== undefined ? 0 : undefined,
-      dailyHoldersRevenue: holdersRevenueRatio !== undefined ? 0 : undefined,
+      dailyRevenue: hasDynamicFeeBreakdown || revenueRatio !== undefined ? 0 : undefined,
+      dailySupplySideRevenue: hasDynamicFeeBreakdown || revenueRatio !== undefined ? 0 : undefined,
+      dailyProtocolRevenue: hasDynamicFeeBreakdown || protocolRevenueRatio !== undefined ? 0 : undefined,
+      dailyHoldersRevenue: hasDynamicFeeBreakdown || holdersRevenueRatio !== undefined ? 0 : undefined,
     }
 
     const blacklistPoolsSet = blacklistPools ? new Set(blacklistPools.map(i => i.toLowerCase())) : null
@@ -233,9 +250,21 @@ export const getUniV3LogAdapter: any = ({ factory, poolCreatedEvent, swapEvent =
       if (blacklistPoolsSet && blacklistPoolsSet.has(pair.toLowerCase())) return;
       const [token0, token1] = pairObject[pair]
       const fee = fees[pair]
+      const breakdown = hasDynamicFeeBreakdown ? (getFeeBreakdown!(fee, { pair, chain }) ?? {}) : null
+      const dynamicProtocolRevenueRatio = breakdown?.protocolRevenueRatio ?? 0
+      const dynamicHoldersRevenueRatio = breakdown?.holdersRevenueRatio ?? 0
+      const dynamicRevenueRatio = breakdown?.revenueRatio ?? (dynamicProtocolRevenueRatio + dynamicHoldersRevenueRatio)
+      const dynamicSupplySideRevenueRatio = breakdown?.supplySideRevenueRatio ?? (1 - dynamicRevenueRatio)
       logs.forEach((log: any) => {
         addOneToken({ chain, balances: dailyVolume, token0, token1, amount0: log.amount0, amount1: log.amount1 })
         addOneToken({ chain, balances: dailyFees, token0, token1, amount0: log.amount0.toString() * fee, amount1: log.amount1.toString() * fee })
+
+        if (hasDynamicFeeBreakdown) {
+          addOneToken({ chain, balances: dynamicDailyRevenue!, token0, token1, amount0: log.amount0.toString() * fee * dynamicRevenueRatio, amount1: log.amount1.toString() * fee * dynamicRevenueRatio })
+          addOneToken({ chain, balances: dynamicDailyProtocolRevenue!, token0, token1, amount0: log.amount0.toString() * fee * dynamicProtocolRevenueRatio, amount1: log.amount1.toString() * fee * dynamicProtocolRevenueRatio })
+          addOneToken({ chain, balances: dynamicDailyHoldersRevenue!, token0, token1, amount0: log.amount0.toString() * fee * dynamicHoldersRevenueRatio, amount1: log.amount1.toString() * fee * dynamicHoldersRevenueRatio })
+          addOneToken({ chain, balances: dynamicDailySupplySideRevenue!, token0, token1, amount0: log.amount0.toString() * fee * dynamicSupplySideRevenueRatio, amount1: log.amount1.toString() * fee * dynamicSupplySideRevenueRatio })
+        }
       })
     })
 
@@ -244,7 +273,12 @@ export const getUniV3LogAdapter: any = ({ factory, poolCreatedEvent, swapEvent =
     }
     const response: any = { dailyVolume, dailyFees }
 
-    if (revenueRatio || revenueRatio === 0) {
+    if (hasDynamicFeeBreakdown) {
+      response.dailyRevenue = dynamicDailyRevenue
+      response.dailySupplySideRevenue = dynamicDailySupplySideRevenue
+      response.dailyProtocolRevenue = dynamicDailyProtocolRevenue
+      response.dailyHoldersRevenue = dynamicDailyHoldersRevenue
+    } else if (revenueRatio || revenueRatio === 0) {
       response.dailyRevenue = dailyFees.clone(revenueRatio, 'Protocol fees')
       response.dailySupplySideRevenue = dailyFees.clone(1 - revenueRatio, 'LP fees')
     }
@@ -280,6 +314,7 @@ type UniV3Config = {
   poolCreatedEvent?: string,
   swapEvent?: string,
   customLogic?: any,
+  getFeeBreakdown?: (fee: number, context: UniV3FeeBreakdownContext) => UniV3FeeBreakdown,
   isAlgebraV3?: boolean,
   isAlgebraV2?: boolean,
   userFeesRatio?: number,

@@ -97,6 +97,7 @@ let usedHelper: string | null | undefined = null;
   const adapterVersion = module.version
   const isHourly = isHourlyAdapter(module)
   const isPlainDate = isPlainDateArg(rawTimeArg)
+  const runAtCurrTime = module.runAtCurrTime ?? Object.values(module.adapter ?? {}).some((config: any) => config?.runAtCurrTime)
 
   function mergeAggregated(target: any, source: any) {
     if (!source) return
@@ -145,7 +146,7 @@ let usedHelper: string | null | undefined = null;
 
   let endTimestamp = endCleanDayTimestamp
   if (adapterVersion === 2) {
-    endTimestamp = (rawTimeArg ? toTimestamp(rawTimeArg) : getTimestamp30MinutesAgo()) // 1 day;
+    endTimestamp = rawTimeArg ? toTimestamp(rawTimeArg) : (runAtCurrTime ? getTimestamp30MinutesAgo() : cleanDayTimestamp)
   } else {
     // checkIfFileExistsInMasterBranch(file)
   }

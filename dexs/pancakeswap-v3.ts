@@ -1,12 +1,11 @@
-import { CHAIN } from "../helpers/chains";
-import { getDefaultDexTokensWhitelisted } from "../helpers/lists";
 import { cache } from "@defillama/sdk";
-import { BaseAdapter, FetchOptions, IJSON, SimpleAdapter } from "../adapters/types";
-import { ethers } from "ethers";
-import { filterPools } from '../helpers/uniswap';
-import { addOneToken } from "../helpers/prices";
-import { queryDune } from "../helpers/dune";
 import axios from "axios";
+import { ethers } from "ethers";
+import { BaseAdapter, Dependencies, FetchOptions, IJSON, SimpleAdapter } from "../adapters/types";
+import { CHAIN } from "../helpers/chains";
+import { queryDune } from "../helpers/dune";
+import { getDefaultDexTokensWhitelisted } from "../helpers/lists";
+import { getUniV3LogAdapter } from '../helpers/uniswap';
 
 const poolCreatedEvent = 'event PoolCreated(address indexed token0, address indexed token1, uint24 indexed fee, int24 tickSpacing, address pool)'
 const poolSwapEvent = 'event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint128 protocolFeesToken0, uint128 protocolFeesToken1)'
@@ -14,7 +13,6 @@ const poolSwapEvent = 'event Swap(address indexed sender, address indexed recipi
 interface Ifactory {
   address: string;
   start: string;
-  blacklistTokens?: Array<string>;
 }
 
 const factories: {[key: string]: Ifactory} = {
@@ -113,23 +111,42 @@ function getHolderRevenueRatio(fee: number): number {
   return 0;
 }
 
-const fetch = async (_a: any, _b: any, options: FetchOptions) => {
-  const factory = String(factories[options.chain].address).toLowerCase()
-  
-  if (!options.chain) throw new Error('Wrong version?')
-  
-  const cacheKey = `tvl-adapter-cache/cache/logs/${options.chain}/${factory}.json`
+const getRevenueBreakdown = (fee: number) => {
+  const protocolRevenueRatio = getProtocolRevenueRatio(fee)
+  const holdersRevenueRatio = getHolderRevenueRatio(fee)
+  const revenueRatio = protocolRevenueRatio + holdersRevenueRatio
+
+  return {
+    protocolRevenueRatio,
+    holdersRevenueRatio,
+    revenueRatio,
+    supplySideRevenueRatio: 1 - revenueRatio,
+  }
+}
+
+const getCachedPoolMetadata = async (chain: string) => {
+  const factory = factories[chain]
+  if (!factory) throw new Error(`Unsupported chain: ${chain}`)
+
+  const cacheKey = `tvl-adapter-cache/cache/logs/${chain}/${factory.address.toLowerCase()}.json`
   const iface = new ethers.Interface([poolCreatedEvent])
   let { logs } = await cache.readCache(cacheKey, { readFromR2Cache: true })
   if (!logs?.length) throw new Error('No pairs found, is there TVL adapter for this already?')
-  logs = logs.map((log: any) => iface.parseLog(log)?.args)
+  logs = logs.map((log: any) => iface.parseLog(log)?.args).filter((log: any) => !!log)
 
   const pairObject: IJSON<string[]> = {}
-  const fees: any = {}
+  const fees: Record<string, number> = {}
   logs.forEach((log: any) => {
-    pairObject[log.pool] = [log.token0, log.token1]
-    fees[log.pool] = (log.fee?.toString() || 0) / 1e6
+    const pool = String(log.pool).toLowerCase()
+    pairObject[pool] = [log.token0, log.token1]
+    fees[pool] = Number(log.fee?.toString() || 0) / 1e6
   })
+
+  return { pairObject, fees }
+}
+
+const fetchBscV3 = async (options: FetchOptions) => {
+  const { fees } = await getCachedPoolMetadata(options.chain)
 
   const dailyVolume = options.createBalances()
   const dailyFees = options.createBalances()
@@ -138,125 +155,79 @@ const fetch = async (_a: any, _b: any, options: FetchOptions) => {
   const dailyHoldersRevenue = options.createBalances()
   const dailySupplySideRevenue = options.createBalances()
 
-  if (options.chain === CHAIN.BSC) {
-    const poolsAndVolumes = await queryDune('3996608',{
-      fullQuery: await PANCAKESWAP_V3_QUERY(options.fromTimestamp, options.toTimestamp),
-    }, options);
+  const poolsAndVolumes = await queryDune('3996608', {
+    fullQuery: await PANCAKESWAP_V3_QUERY(options.fromTimestamp, options.toTimestamp),
+  }, options)
 
-    const poolFees = await options.api.multiCall({
-      abi: 'uint256:fee',
-      calls: poolsAndVolumes.map((item: any) => item.pool)
-    })
-    for (let i = 0; i < poolsAndVolumes.length; i++) {
-      if (poolsAndVolumes[i].clean_volume_usd !== null && poolsAndVolumes[i].total_volume_usd !== null) {
-        // add clean volume, exclude blacklist token
-        dailyVolume.addUSDValue(poolsAndVolumes[i].clean_volume_usd)
+  for (const poolVolume of poolsAndVolumes) {
+    if (poolVolume.clean_volume_usd === null || poolVolume.total_volume_usd === null) continue
 
-        const fee = poolFees[i] ? Number(poolFees[i] / 1e6) : 0
-        const protocolRevenueRatio = getProtocolRevenueRatio(fee);
-        const holdersRevenueRatio = getHolderRevenueRatio(fee);
-        const revenueRatio = protocolRevenueRatio + holdersRevenueRatio;
-        const supplySideRevenueRatio = 1 - revenueRatio;
+    const cleanVolumeUsd = Number(poolVolume.clean_volume_usd)
+    const totalVolumeUsd = Number(poolVolume.total_volume_usd)
+    const fee = fees[String(poolVolume.pool).toLowerCase()] ?? 0
+    const { protocolRevenueRatio, holdersRevenueRatio, revenueRatio, supplySideRevenueRatio } = getRevenueBreakdown(fee)
+    const feeUsd = totalVolumeUsd * fee
 
-        // add fees from total volume, including blacklist tokens
-        dailyFees.addUSDValue(Number(poolsAndVolumes[i].total_volume_usd) * fee)
-        dailyRevenue.addUSDValue(Number(poolsAndVolumes[i].total_volume_usd) * fee * revenueRatio)
-        dailyProtocolRevenue.addUSDValue(Number(poolsAndVolumes[i].total_volume_usd) * fee * protocolRevenueRatio)
-        dailyHoldersRevenue.addUSDValue(Number(poolsAndVolumes[i].total_volume_usd) * fee * holdersRevenueRatio)
-        dailySupplySideRevenue.addUSDValue(Number(poolsAndVolumes[i].total_volume_usd) * fee * supplySideRevenueRatio)
-      }
-    }
-  } else {
-    const filteredPairs = await filterPools({ api: options.api, pairs: pairObject, createBalances: options.createBalances })
-    const allLogs = await options.getLogs({ targets: Object.keys(filteredPairs), eventAbi: poolSwapEvent, flatten: false })
-    allLogs.map((logs: any, index) => {
-      if (!logs.length) return;
-      const pair = Object.keys(filteredPairs)[index]
-      const [token0, token1] = pairObject[pair]
-      const fee = fees[pair]
-      logs.forEach((log: any) => {
-        const protocolRevenueRatio = getProtocolRevenueRatio(fee);
-        const holdersRevenueRatio = getHolderRevenueRatio(fee);
-        const revenueRatio = protocolRevenueRatio + holdersRevenueRatio;
-        const supplySideRevenueRatio = 1 - revenueRatio;
-  
-        const amount0 = Number(log.amount0)
-        const amount1 = Number(log.amount1)
-  
-        addOneToken({ chain: options.chain, balances: dailyVolume, token0, token1, amount0, amount1 })
-        addOneToken({ chain: options.chain, balances: dailyFees, token0, token1, amount0: amount0 * fee, amount1: amount1 * fee })
-        addOneToken({ chain: options.chain, balances: dailyRevenue, token0, token1, amount0: amount0 * fee * revenueRatio, amount1: amount1 * fee * revenueRatio })
-        addOneToken({ chain: options.chain, balances: dailyProtocolRevenue, token0, token1, amount0: amount0 * fee * protocolRevenueRatio, amount1: amount1 * fee * protocolRevenueRatio })
-        addOneToken({ chain: options.chain, balances: dailyHoldersRevenue, token0, token1, amount0: amount0 * fee * holdersRevenueRatio, amount1: amount1 * fee * holdersRevenueRatio })
-        addOneToken({ chain: options.chain, balances: dailySupplySideRevenue, token0, token1, amount0: amount0 * fee * supplySideRevenueRatio, amount1: amount1 * fee * supplySideRevenueRatio })
-      })
-    })
+    dailyVolume.addUSDValue(cleanVolumeUsd)
+    dailyFees.addUSDValue(feeUsd)
+    dailyRevenue.addUSDValue(feeUsd * revenueRatio)
+    dailyProtocolRevenue.addUSDValue(feeUsd * protocolRevenueRatio)
+    dailyHoldersRevenue.addUSDValue(feeUsd * holdersRevenueRatio)
+    dailySupplySideRevenue.addUSDValue(feeUsd * supplySideRevenueRatio)
   }
-  
+
   return { dailyVolume, dailyFees, dailyUserFees: dailyFees, dailyRevenue, dailySupplySideRevenue, dailyProtocolRevenue, dailyHoldersRevenue }
 }
 
 const pancakeSolanaExplorer = 'https://sol-explorer.pancakeswap.com/api/cached/v1/pools/info/list?poolType=concentrated&poolSortField=default&order=desc'
 const blacklistPools = [
   'EbkGwrT4zf7Hczrn23zyoPJHThd2NHguJnyWiJe9wf9D',
-];
+]
 
-const fetchSolanaV3 = async (_a: any, _b: any, options: FetchOptions) => {
-  let dailyVolume = 0;
-  let dailyFees = 0;
-  let dailyProtocolRevenue = 0;
-  let dailyHoldersRevenue = 0;
-  let dailySupplySideRevenue = 0;
+const fetchSolanaV3 = async (options: FetchOptions) => {
+  let dailyVolume = 0
+  let dailyFees = 0
+  let dailyProtocolRevenue = 0
+  let dailyHoldersRevenue = 0
+  let dailySupplySideRevenue = 0
 
-  let page = 1;
-  let allPools: Array<any> = [];
-  do {
-    const response = await axios.get(`${pancakeSolanaExplorer}&pageSize=100&page=${page}`);
-    const pools = response.data.data;
-    if (pools.length == 0) {
-      break;
-    }
-    allPools = allPools.concat(pools);
+  let page = 1
+  const allPools: Array<any> = []
+  while (true) {
+    const response = await axios.get(`${pancakeSolanaExplorer}&pageSize=100&page=${page}`)
+    const pools = response.data.data
+    if (!pools.length) break
 
-    page += 1;
-  } while(true)
-  
-  // ONLY use Dune query for solana when refill history data
-  let poolsAndVolumes: any = null;
-  const todayTimestamp = Math.floor(new Date().getTime() / 1000);
-  if (options.startOfDay < todayTimestamp - 48 * 3600) {
-    poolsAndVolumes = await queryDune('3996608', {
-      fullQuery: PANCAKESWAP_V3_QUERY_SOLANA(options.fromTimestamp, options.toTimestamp),
-    }, options);
+    allPools.push(...pools)
+    page += 1
   }
-  
-  for (const pool of allPools.filter(pool => !blacklistPools.includes(pool.id))) {
+
+  const todayTimestamp = Math.floor(Date.now() / 1000)
+  const useDuneBackfill = options.startOfDay < todayTimestamp - 48 * 3600
+  let historicalVolumeByPool = new Map<string, number>()
+
+  if (useDuneBackfill) {
+    const poolsAndVolumes = await queryDune('3996608', {
+      fullQuery: PANCAKESWAP_V3_QUERY_SOLANA(options.fromTimestamp, options.toTimestamp),
+    }, options)
+    historicalVolumeByPool = new Map(
+      poolsAndVolumes.map((item: any) => [item.pool, Number(item.volume_usd)])
+    )
+  }
+
+  for (const pool of allPools) {
+    if (blacklistPools.includes(pool.id)) continue
+
     const feeRate = pool.feeRate ? Number(pool.feeRate) : 0
+    const volume = useDuneBackfill ? historicalVolumeByPool.get(pool.id) ?? 0 : Number(pool.day.volume)
+    const fee = useDuneBackfill ? volume * feeRate : Number(pool.day.volumeFee)
+    const { protocolRevenueRatio, holdersRevenueRatio, supplySideRevenueRatio } = getRevenueBreakdown(feeRate)
 
-    let volume = 0
-    let fee = 0
-    if (options.startOfDay < todayTimestamp - 48 * 3600) {
-      const item = poolsAndVolumes.find((i: any) => i.pool === pool.id)
-      if (item) {
-        volume = Number(item.volume_usd)
-        fee = volume * feeRate
-      }
-    } else {
-      volume = Number(pool.day.volume)
-      fee = Number(pool.day.volumeFee)
-    }
-
-    dailyVolume += volume;
-    dailyFees += fee;
-    
-    const protocolRevenueRatio = getProtocolRevenueRatio(feeRate);
-    const holdersRevenueRatio = getHolderRevenueRatio(feeRate);
-    const revenueRatio = protocolRevenueRatio + holdersRevenueRatio;
-    const supplySideRevenueRatio = 1 - revenueRatio;
-
-    dailyProtocolRevenue += Number(fee) * protocolRevenueRatio
-    dailyHoldersRevenue += Number(fee) * holdersRevenueRatio
-    dailySupplySideRevenue += Number(fee) * supplySideRevenueRatio
+    dailyVolume += volume
+    dailyFees += fee
+    dailyProtocolRevenue += fee * protocolRevenueRatio
+    dailyHoldersRevenue += fee * holdersRevenueRatio
+    dailySupplySideRevenue += fee * supplySideRevenueRatio
   }
 
   return {
@@ -270,6 +241,28 @@ const fetchSolanaV3 = async (_a: any, _b: any, options: FetchOptions) => {
   }
 }
 
+const pancakeV3Adapter = Object.entries(factories).reduce((acc, [chain, config]) => {
+  acc[chain] = {
+    fetch: chain === CHAIN.BSC
+      ? fetchBscV3
+      : getUniV3LogAdapter({
+        factory: config.address,
+        poolCreatedEvent,
+        swapEvent: poolSwapEvent,
+        userFeesRatio: 1,
+        getFeeBreakdown: (fee: number) => getRevenueBreakdown(fee),
+      }),
+    start: config.start,
+  }
+
+  return acc
+}, {
+  [CHAIN.SOLANA]: {
+    fetch: fetchSolanaV3,
+    start: '2025-07-11',
+  },
+} as BaseAdapter)
+
 const methodology = {
   Fees: "Total trading fees - sum of LP fees and protocol fees. LP fees vary by pool type (0.25% for most pools, with some special pools having different rates). Protocol fees are 0.05% for most pools.",
   UserFees: "All trading fees paid by users",
@@ -280,22 +273,11 @@ const methodology = {
 }
 
 const adapter: SimpleAdapter = {
-  version: 1,
+  version: 2,
   isExpensiveAdapter: true,
+  dependencies: [Dependencies.DUNE],
   methodology,
-  adapter: {
-    [CHAIN.SOLANA]: {
-      fetch: fetchSolanaV3,
-      start: '2025-07-11',
-    },
-  },
-};
-
-for (const [chain, config] of Object.entries(factories)) {
-  (adapter.adapter as BaseAdapter)[chain] = {
-    fetch: fetch,
-    start: config.start,
-  }
+  adapter: pancakeV3Adapter,
 }
 
 export default adapter;
